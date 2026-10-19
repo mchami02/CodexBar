@@ -1,0 +1,31 @@
+source: real OpenAIDashboardWebViewCache + OpenAIDashboardNavigationDelegate + WebKitTeardown + WebKitContentProcess (this branch), compiled with -D DEBUG against small stubs for logging and OpenAIDashboardFetcher statics
+fixture: prepareForTesting loads a local page that starts an endless Promise microtask chain (the #4641 sample shape); the caller then awaits lease.webView.evaluateJavaScript inside the lease scope, as collectPageSnapshot does
+host: macOS 15.5 (24F74), Apple M2; acquire navigationTimeout=2 s
+control: leaseOverrunGrace=1e6 s (equivalent to main, which has no watchdog)
+fix: leaseOverrunGrace=3 s (production default is 15 s)
+
+===== CONTROL
+mode=control grace=1000000.0s acquire deadline=2s webContentPID=92782
+  page spinning: cpu%/time=95.8   0:01.06
+  t=4s since acquire: cpu%/time=100.0   0:04.33 entries=1
+  t=8s since acquire: cpu%/time=100.0   0:07.61 entries=1
+  t=11s since acquire: cpu%/time=100.1   0:10.88 entries=1
+  t=14s since acquire: cpu%/time=100.0   0:14.15 entries=1
+  t=18s since acquire: cpu%/time=98.7   0:17.41 entries=1
+  RESULT: caller still suspended after 14s, helper still burning CPU (bug reproduced)
+
+===== FIX
+mode=watchdog grace=3.0s acquire deadline=2s webContentPID=92966
+  page spinning: cpu%/time=98.9   0:01.10
+  t=5s since acquire: cpu%/time=100.0   0:04.38 entries=1
+  [lease] [webview] OpenAI WebView lease overran its deadline; terminating its unresponsive page.
+  [log.warning openai-webview] OpenAI webview lease overran deadline [:]
+  [log.warning webkit-teardown] WebContent process terminated [:]
+  evaluation failed after 5.1s: JavaScript execution returned a result of an unsupported type
+  after unwind: GONE entries=0
+  t=8s since acquire: GONE entries=0
+  t=11s since acquire: GONE entries=0
+  t=14s since acquire: GONE entries=0
+  t=18s since acquire: GONE entries=0
+  12s later: GONE
+  RESULT: PASS

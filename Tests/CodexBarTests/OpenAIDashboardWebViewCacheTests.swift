@@ -355,6 +355,67 @@ struct OpenAIDashboardWebViewCacheTests {
         cache.clearAllForTesting()
     }
 
+    // MARK: - Lease Overrun Tests
+
+    @Test
+    func `Lease held past its deadline terminates the page and evicts the WebView`() async throws {
+        if self.shouldSkipOnCI() {
+            return
+        }
+        let cache = OpenAIDashboardWebViewCache(leaseOverrunGrace: 0.05)
+        var terminated: [WKWebView] = []
+        cache.terminateWebContentProcessForTesting = { terminated.append($0) }
+        let store = WKWebsiteDataStore.nonPersistent()
+        let url = try #require(URL(string: "about:blank"))
+
+        let lease = try await cache.acquire(
+            websiteDataStore: store,
+            usageURL: url,
+            logger: nil,
+            navigationTimeout: 0.1)
+
+        let deadline = Date().addingTimeInterval(2)
+        while terminated.isEmpty, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+
+        #expect(terminated.count == 1)
+        #expect(terminated.first === lease.webView, "Watchdog must terminate the leased WebView's page")
+        #expect(!cache.hasCachedEntry(for: store), "Overrun WebView must not be reused")
+
+        lease.release()
+        lease.release()
+        #expect(terminated.count == 1, "Late release must not terminate again")
+
+        cache.clearAllForTesting()
+    }
+
+    @Test
+    func `Lease released before its deadline never terminates the page`() async throws {
+        if self.shouldSkipOnCI() {
+            return
+        }
+        let cache = OpenAIDashboardWebViewCache(leaseOverrunGrace: 0.05)
+        var terminated: [WKWebView] = []
+        cache.terminateWebContentProcessForTesting = { terminated.append($0) }
+        let store = WKWebsiteDataStore.nonPersistent()
+        let url = try #require(URL(string: "about:blank"))
+
+        let lease = try await cache.acquire(
+            websiteDataStore: store,
+            usageURL: url,
+            logger: nil,
+            navigationTimeout: 0.1,
+            preserveLoadedPageOnRelease: true)
+        lease.release()
+
+        try? await Task.sleep(for: .milliseconds(400))
+
+        #expect(terminated.isEmpty)
+
+        cache.clearAllForTesting()
+    }
+
     @Test
     func `Reused page reset clears one shot scraper globals`() async throws {
         if self.shouldSkipOnCI() {

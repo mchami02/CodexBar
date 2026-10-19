@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.78.1 — Unreleased
+
+### Fixed
+
+- Codex: terminate the hidden OpenAI dashboard page when a scrape holds it past its refresh deadline, so a page stuck in JavaScript no longer keeps a WebKit helper at a full CPU core until CodexBar quits (#4641). Thanks @mchami02!
+
 ## 0.78.0 — 2026-10-19
 
 ### Highlights

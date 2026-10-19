@@ -18,6 +18,7 @@ final class OpenAIDashboardWebViewCache {
     private final class ReleaseState {
         var preserveLoadedPageOnRelease: Bool
         var isReleased = false
+        var overrunWatchdog: Task<Void, Never>?
 
         init(preserveLoadedPageOnRelease: Bool) {
             self.preserveLoadedPageOnRelease = preserveLoadedPageOnRelease
@@ -131,12 +132,17 @@ final class OpenAIDashboardWebViewCache {
     /// Keep the WebView alive only long enough for immediate retries/menu reopens.
     /// Long-lived hidden ChatGPT tabs still consume noticeable energy on some setups.
     private let idleTimeout: TimeInterval
+    /// How long a lease may outlive its acquire deadline before its page is presumed hung.
+    /// Callers stop polling at the deadline, so only a JavaScript evaluation that WebKit never
+    /// answers keeps a lease past it; that page's WebContent process is then terminated (#4641).
+    private let leaseOverrunGrace: TimeInterval
     private var idlePruneWorkItem: DispatchWorkItem?
     private var idlePruneGeneration = 0
     #if DEBUG
     private(set) var idlePruneDeadlineForTesting: Date?
     var prepareForTesting: ((WKWebView, TimeInterval, Bool) async throws -> Void)?
     var didCreateWebViewForTesting: ((WKWebView, AnyObject) -> Void)?
+    var terminateWebContentProcessForTesting: ((WKWebView) -> Void)?
     #endif
     /// Reuse the validated analytics page only for the immediate next handoff.
     private let preservedPageHandoffTimeout: TimeInterval = 5
@@ -169,8 +175,9 @@ final class OpenAIDashboardWebViewCache {
     })();
     """
 
-    init(idleTimeout: TimeInterval = 60) {
+    init(idleTimeout: TimeInterval = 60, leaseOverrunGrace: TimeInterval = 15) {
         self.idleTimeout = idleTimeout
+        self.leaseOverrunGrace = leaseOverrunGrace
     }
 
     nonisolated static func remainingNavigationTimeout(
@@ -370,6 +377,7 @@ final class OpenAIDashboardWebViewCache {
                 key: key,
                 isTemporary: isTemporary,
                 preserveLoadedPageOnRelease: preserveLoadedPageOnRelease,
+                deadline: deadline,
                 log: log)
         }
     }
@@ -379,9 +387,16 @@ final class OpenAIDashboardWebViewCache {
         key: ObjectIdentifier,
         isTemporary: Bool,
         preserveLoadedPageOnRelease: Bool,
+        deadline: Date,
         log: @escaping (String) -> Void) -> OpenAIDashboardWebViewLease
     {
         let releaseState = ReleaseState(preserveLoadedPageOnRelease: preserveLoadedPageOnRelease)
+        self.scheduleLeaseOverrunWatchdog(
+            entry: entry,
+            key: key,
+            releaseState: releaseState,
+            deadline: deadline,
+            log: log)
         // The lease owns cleanup even after cache eviction; the entry never retains its lease.
         return OpenAIDashboardWebViewLease(
             webView: entry.webView,
@@ -393,6 +408,8 @@ final class OpenAIDashboardWebViewCache {
             release: { [weak self, entry] in
                 guard !releaseState.isReleased else { return }
                 releaseState.isReleased = true
+                releaseState.overrunWatchdog?.cancel()
+                releaseState.overrunWatchdog = nil
                 if !isTemporary, let self {
                     self.releaseCachedEntry(
                         entry,
@@ -402,6 +419,39 @@ final class OpenAIDashboardWebViewCache {
                     entry.close()
                 }
             })
+    }
+
+    private func scheduleLeaseOverrunWatchdog(
+        entry: Entry,
+        key: ObjectIdentifier,
+        releaseState: ReleaseState,
+        deadline: Date,
+        log: @escaping (String) -> Void)
+    {
+        let delay = max(0, deadline.timeIntervalSinceNow) + self.leaseOverrunGrace
+        releaseState.overrunWatchdog = Task { @MainActor [weak self, weak entry] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, !releaseState.isReleased, let entry else { return }
+            releaseState.overrunWatchdog = nil
+            log("OpenAI WebView lease overran its deadline; terminating its unresponsive page.")
+            Self.log.warning("OpenAI webview lease overran deadline")
+            self?.terminateWebContentProcess(entry.webView)
+            if let self, self.entries[key] === entry {
+                self.evictEntry(entry)
+            } else {
+                entry.close()
+            }
+        }
+    }
+
+    private func terminateWebContentProcess(_ webView: WKWebView) {
+        #if DEBUG
+        if let terminateWebContentProcessForTesting {
+            terminateWebContentProcessForTesting(webView)
+            return
+        }
+        #endif
+        WebKitContentProcess.terminate(webView)
     }
 
     private func invalidateAcquisitions(for key: ObjectIdentifier? = nil) {
